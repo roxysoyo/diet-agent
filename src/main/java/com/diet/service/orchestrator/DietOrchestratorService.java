@@ -29,13 +29,13 @@ import com.diet.service.session.SessionService;
 import com.diet.service.session.SessionStateService;
 import com.diet.service.slot.SlotMergeService;
 import com.diet.service.trace.AgentTraceService;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 饮食推荐多 Agent 编排服务（Orchestrator）。
@@ -111,9 +111,14 @@ public class DietOrchestratorService {
     private final AgentTraceService agentTraceService;
 
     /**
-     * 会话级锁 Map，key=sessionId，value=锁对象，保证同 session 串行写状态。
+     * 会话锁条带，按 sessionId 哈希映射到固定数量的锁对象，保证同 session 串行写状态。
+     * <p>
+     * 用固定数组而不是 Map：Map 会随会话数无界增长（锁对象永远不会被移除），
+     * 而带淘汰的缓存又可能在锁被持有期间驱逐它，导致两个线程拿到不同锁、临界区失效。
+     * 条带方案内存固定且锁对象永不失效；代价是哈希碰撞时两个无关会话共享一把锁，
+     * 只影响并发度，不影响正确性。
      */
-    private final Map<String, Object> sessionLocks = new ConcurrentHashMap<>();
+    private final Object[] sessionLocks;
 
     /**
      * Spring 构造器注入全部依赖。
@@ -130,7 +135,8 @@ public class DietOrchestratorService {
             RecommendResponseAgentService recommendResponseAgentService,
             MealService mealService,
             RiskGuardService riskGuardService,
-            AgentTraceService agentTraceService
+            AgentTraceService agentTraceService,
+            @Value("${diet.concurrency.lock-stripes:1024}") int lockStripes
     ) {
         this.sessionService = sessionService;                           // 注入消息落库服务
         this.sessionStateService = sessionStateService;                 // 注入会话状态服务
@@ -144,6 +150,28 @@ public class DietOrchestratorService {
         this.mealService = mealService;                                 // 注入餐食服务
         this.riskGuardService = riskGuardService;             // 注入健康守卫
         this.agentTraceService = agentTraceService;                     // 注入链路追踪服务
+        this.sessionLocks = createLockStripes(lockStripes);             // 预先创建全部会话锁条带
+    }
+
+    /**
+     * 创建固定数量的会话锁条带。
+     * 条带数至少为 1，避免非法配置导致取模异常。
+     */
+    private static Object[] createLockStripes(int stripes) {
+        int size = Math.max(1, stripes);
+        Object[] locks = new Object[size];
+        for (int index = 0; index < size; index++) {
+            locks[index] = new Object();
+        }
+        return locks;
+    }
+
+    /**
+     * 按 sessionId 哈希取对应的条带锁。
+     * 与 Integer.MAX_VALUE 做与运算而不是 Math.abs，避免 hashCode 为 Integer.MIN_VALUE 时取绝对值溢出。
+     */
+    private Object lockFor(String sessionId) {
+        return sessionLocks[(sessionId.hashCode() & Integer.MAX_VALUE) % sessionLocks.length];
     }
 
     /**
@@ -172,8 +200,8 @@ public class DietOrchestratorService {
                 // Trace 事件：REQUEST_RECEIVED | 阶段 HTTP | 输入=ChatRequest | 输出=初始 SessionState
                 agentTraceService.recordEvent("REQUEST_RECEIVED", "HTTP", request, initialState);
 
-                // 获取或创建该 sessionId 对应的锁对象，保证同一 session 并发请求串行执行
-                Object lock = sessionLocks.computeIfAbsent(initialState.sessionId(), key -> new Object());
+                // 取该 sessionId 对应的条带锁，保证同一 session 并发请求串行执行
+                Object lock = lockFor(initialState.sessionId());
                 synchronized (lock) {
                     // 在锁内执行完整状态机，处理本轮用户输入
                     ChatResponse response = handleTurn(userId, request, traceId, initialState);

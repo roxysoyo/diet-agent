@@ -22,6 +22,12 @@ diet:
     light-model: qwen-turbo
   session:
     max-history-turns: 10
+  cache:
+    # 槽位字典缓存 TTL。diet_slot_option 无写接口，只能靠 TTL 最终一致；设为 0 可关闭缓存
+    slot-options-ttl-minutes: 10
+  concurrency:
+    # 会话锁条带数。固定内存占用，碰撞只影响并发度不影响正确性
+    lock-stripes: 1024
 logging:
   level:
     com.diet: INFO
